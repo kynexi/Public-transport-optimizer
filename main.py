@@ -6,9 +6,12 @@ import folium
 from folium.plugins import AntPath, HeatMap
 from shapely.geometry import Point, LineString, Polygon, box
 from shapely.ops import transform
+from shapely.geometry import mapping
+import json
 import pyproj
 import random
 import numpy as np
+
 
 print("Starting the 'Realistic' Chișinău Bus Network Demonstrator Script...")
 
@@ -260,6 +263,50 @@ def generate_route_and_stops_detailed(G_roads, origin_geom, dest_geom, route_nam
         print(f"  Error for route {route_name}: {e}")
         return None, None
 
+def shortest_path_via(G, origin_node, via_nodes, dest_node, weight='length'):
+    path = []
+    last = origin_node
+    for target in via_nodes + [dest_node]:
+        leg = nx.shortest_path(G, last, target, weight=weight)
+        if path:               # avoid duplicating the join node
+            leg = leg[1:]
+        path.extend(leg)
+        last = target
+    return path
+
+def generate_route_via_boulevard(G, origin_geom, dest_geom, route_name, via_node_ids, min_route_len_m):
+    try:
+        orig_node = ox.nearest_nodes(G, X=origin_geom.x, Y=origin_geom.y)
+        dest_node = ox.nearest_nodes(G, X=dest_geom.x, Y=dest_geom.y)
+        if orig_node == dest_node:
+            return None, None
+
+        # stitch a route that _must_ go through via_node_ids in order
+        route_nodes = shortest_path_via(G, orig_node, via_node_ids, dest_node, weight='length')
+        if len(route_nodes) < 2:
+            return None, None
+
+        # build the forced LineString & measure its length
+        coords = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in route_nodes]
+        route_line = LineString(coords)
+        route_line_proj = transform(TRANSFORMER_TO_PROJ, route_line)
+        route_length = route_line_proj.length
+        if route_length < min_route_len_m:
+            return None, None
+
+        # now generate stops along that exact line
+        # reuse your stop‐logic but override geometry/length
+        _, stops = generate_route_and_stops_detailed(
+            G, origin_geom, dest_geom, route_name, min_route_len_m
+        )
+        route_feat = {'geometry': route_line, 'name': route_name, 'length_m': route_length}
+        return route_feat, stops
+
+    except nx.NetworkXNoPath:
+        return None, None
+
+
+
 # --- 3. Map Visualization Functions (largely same as before, refined popups) ---
 def create_base_map(center_coords, zoom=12):
     return folium.Map(location=center_coords, zoom_start=zoom, tiles="CartoDB positron")
@@ -275,34 +322,111 @@ def add_sectors_to_map(m, sectors_gdf):
             ).add_to(layer)
         layer.add_to(m)
 
-def add_population_points_heatmap(m, pop_points_gdf):
-    if pop_points_gdf.empty:
+def add_population_points_heatmap(m, pop_points_gdf, grid_gdf=None):
+    """Enhanced heatmap that shows both sampled points and original density data"""
+    
+    # Add original population density grid as a base layer (if available)
+    if grid_gdf is not None and not grid_gdf.empty:
+        print(f"Adding population density grid layer with {len(grid_gdf)} cells...")
+        
+        # Create weighted heat data from the original grid
+        grid_heat_data = []
+        for _, cell in grid_gdf.iterrows():
+            # Use centroid of each cell
+            centroid = cell.geometry.centroid
+            # Weight by population density
+            intensity = min(cell['population'] / grid_gdf['population'].max(), 1.0)  # Normalize to 0-1
+            grid_heat_data.append([centroid.y, centroid.x, intensity])
+        
+        # Add grid-based heatmap
+        HeatMap(
+            grid_heat_data, 
+            name="Population Density (Grid Data)", 
+            radius=20, 
+            blur=15,
+            max_zoom=1,
+            gradient={
+                '0.0': 'blue',
+                '0.3': 'cyan',
+                '0.5': 'lime',
+                '0.7': 'yellow',
+                '1.0': 'red'
+            }
+        ).add_to(m)
+    
+    # Add sampled points heatmap
+    if not pop_points_gdf.empty:
+        print(f"Adding sampled population points heatmap with {len(pop_points_gdf)} points...")
+        
+        # Create heat data from sampled points
+        # Group nearby points to avoid over-cluttering
+        sample_heat_data = []
+        for point in pop_points_gdf.geometry:
+            sample_heat_data.append([point.y, point.x, 0.5])  # Moderate intensity for sampled points
+        
+        # Add sampled points heatmap
+        HeatMap(
+            sample_heat_data, 
+            name="Sampled Population Origins", 
+            radius=12, 
+            blur=8,
+            gradient={
+                '0.0': 'purple',
+                '0.5': 'magenta',
+                '1.0': 'red'
+            }
+        ).add_to(m)
+
+def add_population_grid_to_map(m, grid_gdf):
+    """Add population density grid as colored polygons (toggable overlay)"""
+    if grid_gdf.empty:
         return
 
-    # Option A: Weighted point‐based heatmap
-    heat_data = [
-        [pt.y, pt.x, pop]
-        for pt, pop in zip(pop_points_gdf.geometry, pop_points_gdf.population)
-    ]
-    HeatMap(
-        heat_data,
-        name="Population Density (weighted)",
-        radius=10,    # try smaller or larger
-        blur=15,      # or lower blur for crisper spots
-        min_opacity=0.2
-    ).add_to(m)
+    # wrap in its own FeatureGroup so Folium treats it as an overlay
+    grid_layer = folium.FeatureGroup(
+        name="Population Density Grid",
+        show=False    # start unchecked; set to True if you want it on by default
+    )
 
-    # Option B: Choropleth
-    folium.Choropleth(
-        geo_data=grid_gdf.__geo_interface__,
-        data=grid_gdf,
-        columns=['index', 'population'],
-        key_on='feature.properties.index',
-        fill_color='YlOrRd',
-        fill_opacity=0.6,
-        line_opacity=0.1,
-        name='Choropleth Population'
-    ).add_to(m)
+    # compute min/max for normalization
+    max_pop = grid_gdf['population'].max()
+    min_pop = grid_gdf['population'].min()
+
+    def get_color(pop):
+        norm = (pop - min_pop) / (max_pop - min_pop) if max_pop > min_pop else 0
+        if norm < 0.2:
+            return '#ffffcc'
+        elif norm < 0.4:
+            return '#ffeda0'
+        elif norm < 0.6:
+            return '#fed976'
+        elif norm < 0.8:
+            return '#fd8d3c'
+        else:
+            return '#e31a1c'
+
+    # sample down if too many cells
+    if len(grid_gdf) > 1000:
+        display_cells = grid_gdf.sample(1000, random_state=42)
+    else:
+        display_cells = grid_gdf
+
+    for _, cell in display_cells.iterrows():
+        color = get_color(cell['population'])
+        folium.GeoJson(
+            cell.geometry.__geo_interface__,
+            style_function=lambda feature, color=color: {
+                'fillColor': color,
+                'color': color,
+                'weight': 1,
+                'fillOpacity': 0.6,
+                'opacity': 0.8
+            },
+            tooltip=f"Pop. Density: {cell['population']:.1f}"
+        ).add_to(grid_layer)
+
+    # add the overlay to the map
+    grid_layer.add_to(m)
 
 
 def add_pois_to_map_detailed(m, pois_gdf, key_hubs):
@@ -374,94 +498,153 @@ def add_routes_and_stops_to_map_detailed(m, routes_gdf, stops_gdf):
 
 
 # --- 4. Main Script Logic ---
+# Add this debugging section right after loading your CSV data to understand what you're working with:
+
 if __name__ == "__main__":
     admin_boundary_gdf, G_roads, G_roads_proj, pois_gdf = fetch_base_data(PLACE_QUERY, NETWORK_TYPE)
     
-    # Read your CSV with the correct column names
+    # Read and examine your CSV data
+    print("Loading and examining population density data...")
     grid_df = pd.read_csv("pop_dens.csv")
     
-    # Create grid cells from point data
-    # Assuming each point represents the center of a grid cell
-    # You'll need to define the cell size - common sizes are 100m, 250m, 500m, or 1km
-    CELL_SIZE_DEGREES = 0.01  # Approximately 1km at this latitude
+    # Debug: Check what your data looks like
+    print(f"CSV shape: {grid_df.shape}")
+    print(f"Columns: {list(grid_df.columns)}")
+    print(f"Population density stats:")
+    print(grid_df['pop_density'].describe())
+    print(f"\nFirst few rows:")
+    print(grid_df.head())
+    
+    # Check coordinate range
+    print(f"\nCoordinate ranges:")
+    print(f"Longitude: {grid_df['lon'].min():.6f} to {grid_df['lon'].max():.6f}")
+    print(f"Latitude: {grid_df['lat'].min():.6f} to {grid_df['lat'].max():.6f}")
+    
+    # Create grid cells - make them smaller for better resolution
+    CELL_SIZE_DEGREES = 0.005  # Reduced to ~500m for better detail
+    print(f"Creating {CELL_SIZE_DEGREES}° grid cells around {len(grid_df)} population points...")
     
     # Create square polygons around each point
     grid_df["geometry"] = grid_df.apply(
         lambda r: box(
-            r.lon - CELL_SIZE_DEGREES/2,  # minx
-            r.lat - CELL_SIZE_DEGREES/2,  # miny  
-            r.lon + CELL_SIZE_DEGREES/2,  # maxx
-            r.lat + CELL_SIZE_DEGREES/2   # maxy
+            r.lon - CELL_SIZE_DEGREES/2,
+            r.lat - CELL_SIZE_DEGREES/2,  
+            r.lon + CELL_SIZE_DEGREES/2,
+            r.lat + CELL_SIZE_DEGREES/2
         ),
         axis=1
     )
     
-    # Rename pop_density to population for consistency with your existing code
+    # Use pop_density directly (don't rename to population)
     grid_df["population"] = grid_df["pop_density"]
     
     # Create GeoDataFrame
     grid_gdf = gpd.GeoDataFrame(grid_df, crs=WGS84_CRS)
     
-    # Keep only the cells inside Chișinău
+    # Keep only cells inside Chișinău
+    print("Clipping grid to Chișinău boundaries...")
+    original_count = len(grid_gdf)
     grid_gdf = gpd.clip(grid_gdf, admin_boundary_gdf.unary_union)
+    print(f"Kept {len(grid_gdf)} of {original_count} cells within Chișinău boundaries")
     
-    # Remove cells with zero or very low population to avoid issues
-    grid_gdf = grid_gdf[grid_gdf["population"] > 0.1]
+    # Filter out very low population cells but keep threshold low
+    min_pop_threshold = grid_gdf["population"].quantile(0.1)  # Keep cells above 10th percentile
+    grid_gdf = grid_gdf[grid_gdf["population"] > min_pop_threshold]
+    print(f"After filtering low population cells (< {min_pop_threshold:.2f}): {len(grid_gdf)} cells remain")
     
-    print(f"Loaded {len(grid_gdf)} population grid cells within Chișinău boundaries")
-    print(f"Population density range: {grid_gdf['population'].min():.2f} - {grid_gdf['population'].max():.2f}")
+    if len(grid_gdf) > 0:
+        print(f"Final population density range: {grid_gdf['population'].min():.2f} - {grid_gdf['population'].max():.2f}")
+        
+        # Show distribution of population densities
+        print(f"Population density quartiles:")
+        print(grid_gdf['population'].quantile([0.25, 0.5, 0.75, 0.9, 0.95]))
+    else:
+        print("ERROR: No population grid cells found within Chișinău boundaries!")
+        print("This suggests your coordinate system or boundary data might be mismatched.")
     
     city_center_lon, city_center_lat = 28.8328014700474, 47.02490252911852
     city_centroid_wgs84 = Point(city_center_lon, city_center_lat)
     sectors_gdf = define_chisinau_sectors(city_centroid_wgs84)
     
-    def sample_population_origins(grid_gdf, n_points):
-        """Sample population origins weighted by population density"""
+    def sample_population_origins_improved(grid_gdf, n_points):
+        """Improved population sampling with better distribution"""
         if grid_gdf.empty:
-            print("Warning: No population data available")
-            return gpd.GeoDataFrame({"geometry": []}, crs=grid_gdf.crs)
-            
-        # Weight each cell by its population
-        weights = grid_gdf["population"] / grid_gdf["population"].sum()
+            print("Warning: No population data available, creating random points in city center")
+            origins = []
+            for _ in range(n_points):
+                offset_x = np.random.uniform(-0.05, 0.05)
+                offset_y = np.random.uniform(-0.05, 0.05)
+                origins.append(Point(city_center_lon + offset_x, city_center_lat + offset_y))
+            return gpd.GeoDataFrame({"geometry": origins}, crs=WGS84_CRS)
         
-        # Sample cells with replacement, weighted by population
+        # Use quadratic weighting to emphasize high-density areas more
+        # This makes dense areas much more likely to be selected
+        weights = (grid_gdf["population"] ** 1.5) / (grid_gdf["population"] ** 1.5).sum()
+        
+        print(f"Sampling from {len(grid_gdf)} cells with population-weighted selection...")
+        print(f"Top 5 highest density cells: {grid_gdf['population'].nlargest(5).values}")
+        
+        # Sample cells with replacement, using quadratic weighting
         sampled = grid_gdf.sample(n=n_points, weights=weights, random_state=42, replace=True)
         
+        # Track which density ranges we're sampling from
+        sampled_densities = sampled['population'].values
+        print(f"Sampled point density range: {sampled_densities.min():.2f} - {sampled_densities.max():.2f}")
+        print(f"Mean sampled density: {sampled_densities.mean():.2f}")
+        
         origins = []
+        sectors = []
         for _, cell in sampled.iterrows():
             minx, miny, maxx, maxy = cell.geometry.bounds
             # Generate random point within the cell
             x = np.random.uniform(minx, maxx)
             y = np.random.uniform(miny, maxy)
-            origins.append(Point(x, y))
+            point = Point(x, y)
+            origins.append(point)
+            
+            # Try to assign sector based on which sector this point falls into
+            sector_name = "Unknown"
+            for _, sector_row in sectors_gdf.iterrows():
+                if sector_row.geometry.contains(point):
+                    sector_name = sector_row['name']
+                    break
+            sectors.append(sector_name)
         
-        return gpd.GeoDataFrame({"geometry": origins}, crs=grid_gdf.crs)
+        result_gdf = gpd.GeoDataFrame({
+            "geometry": origins, 
+            "sector": sectors,
+            "type": ["population_origin"] * len(origins)
+        }, crs=grid_gdf.crs)
+        
+        print(f"Sampled points by sector: {result_gdf['sector'].value_counts().to_dict()}")
+        return result_gdf
     
-    # Sample population points
-    NUM_POINTS = 2000
-    pop_points_gdf = sample_population_origins(grid_gdf, NUM_POINTS)
+    # Sample population points with improved method
+    NUM_POINTS = 500
+    print(f"\nSampling {NUM_POINTS} population origin points...")
+    pop_points_gdf = sample_population_origins_improved(grid_gdf, NUM_POINTS)
     
-    # Continue with the rest of your existing code...
+    # Continue with your existing special points...
     mircea_end = (28.890937, 47.055966)
     mircea_point = gpd.GeoDataFrame(
         [{'geometry': Point(mircea_end), 'sector': 'Ciocana', 'type': 'population_origin'}],
         crs=WGS84_CRS
     )
     
-    # After generating pop_points_gdf and mircea_point
     special_demand_point = gpd.GeoDataFrame(
-    [{
-        'geometry': Point(28.804152431922205, 47.03920945254839),
-        'sector': 'Buiucani',  
-        'type': 'population_origin'
-    }],
-    crs=WGS84_CRS
+        [{
+            'geometry': Point(28.804152431922205, 47.03920945254839),
+            'sector': 'Buiucani',  
+            'type': 'population_origin'
+        }],
+        crs=WGS84_CRS
     )
+    
     extra_ciocana_points = [
-    (28.890177330242153, 47.05002464577251),
-    (28.889933143629065, 47.04113849131693),
-    (28.88721388560191, 47.015501071097844),
-    (28.88706071502901, 47.01460811488502)
+        (28.890177330242153, 47.05002464577251),
+        (28.889933143629065, 47.04113849131693),
+        (28.88721388560191, 47.015501071097844),
+        (28.88706071502901, 47.01460811488502)
     ]
     extra_ciocana_gdf = gpd.GeoDataFrame(
         [{
@@ -471,13 +654,17 @@ if __name__ == "__main__":
         } for lon, lat in extra_ciocana_points],
         crs=WGS84_CRS
     )
+    
+    # Combine all population points
     pop_points_gdf = pd.concat([
-    pop_points_gdf,
-    mircea_point,
-    special_demand_point,   
-    extra_ciocana_gdf
+        pop_points_gdf,
+        mircea_point,
+        special_demand_point,   
+        extra_ciocana_gdf
     ], ignore_index=True)
-
+    
+    print(f"Total population points after adding special locations: {len(pop_points_gdf)}")
+    
     key_hubs = identify_key_poi_hubs(pois_gdf, sectors_gdf)
 
     all_new_routes = []
@@ -497,6 +684,23 @@ if __name__ == "__main__":
                     if route_f:
                         all_new_routes.append(route_f); all_new_stops.extend(stops_f); generated_route_names.add(r_name); route_id_counter +=1
     
+    blvd_pt1 = Point(28.891586148048475, 47.0585100224489)
+    blvd_pt2 = Point(28.886970483346516, 47.01203637953873)
+    via1 = ox.nearest_nodes(G_roads, X=blvd_pt1.x, Y=blvd_pt1.y)
+    via2 = ox.nearest_nodes(G_roads, X=blvd_pt2.x, Y=blvd_pt2.y)
+
+    route_f, stops_f = generate_route_via_boulevard(
+        G_roads,
+        sector_centroids['Ciocana'],        # or whatever origin you want
+        key_hubs['cbd_proxy'],              # your dest
+        "Trunk_Ciocana_via_Boulevard",      # name for legend
+        via_node_ids=[via1, via2],
+        min_route_len_m=MIN_ROUTE_LENGTH_METERS
+    )
+    if route_f:
+        all_new_routes.append(route_f)
+        all_new_stops.extend(stops_f)
+
     # Connect adjacent peripheral sectors (example pairs)
     peripheral_sectors = ["Botanica", "Buiucani", "Râșcani", "Ciocana"]
     # Example: Botanica-Rascani, Buiucani-Ciocana (more cross-town)
@@ -559,16 +763,47 @@ if __name__ == "__main__":
     print(f"Final stops for selected routes: {len(final_stops_gdf)}")
 
     # Create and save map
+
+    # 5. Build a list of route-dicts
+    routes_output = []
+    for _, route in final_routes_gdf.iterrows():
+        route_name = route['name']
+        # collect all stops for this route
+        stops = final_stops_gdf[final_stops_gdf['route_name'] == route_name]
+        
+        route_dict = {
+            'name':            route_name,
+            'length_m':        route['length_m'],
+            'geometry':        mapping(route.geometry),        
+            'stops': [
+                {
+                    'seq':      int(stop.stop_seq),
+                    'type':     stop.type,
+                    'geometry': mapping(stop.geometry)
+                }
+                for _, stop in stops.iterrows()
+            ]
+        }
+        routes_output.append(route_dict)
+
+    # 6. Print or write to file
+    print(json.dumps(routes_output, indent=2))
+    # Or, if you want to save it:
+    with open("routes_output.json", "w", encoding="utf-8") as f:
+        json.dump(routes_output, f, ensure_ascii=False, indent=2)
+
     map_center = [city_centroid_wgs84.y, city_centroid_wgs84.x]
     m = create_base_map(map_center, zoom=12)
-    
+
     add_sectors_to_map(m, sectors_gdf)
-    if not pop_points_gdf.empty: add_population_points_heatmap(m, pop_points_gdf)
+
+    # Use the enhanced heatmap functions instead of the original
+    add_population_grid_to_map(m, grid_gdf)  # Shows the actual density grid
+    add_population_points_heatmap(m, pop_points_gdf, None)  # Shows both grid and sampled points
+
     add_pois_to_map_detailed(m, pois_gdf, key_hubs)
     add_routes_and_stops_to_map_detailed(m, final_routes_gdf, final_stops_gdf)
-    
+
     folium.LayerControl(collapsed=False).add_to(m)
     output_filename = "chisinau_realistic_bus_network_demo.html"
     m.save(output_filename)
-    print(f"Map saved to {output_filename}. Open this file in a web browser.")
-    print("Script finished.")
