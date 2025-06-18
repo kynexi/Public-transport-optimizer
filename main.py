@@ -4,7 +4,7 @@ import geopandas as gpd
 import pandas as pd
 import folium
 from folium.plugins import AntPath, HeatMap
-from shapely.geometry import Point, LineString, Polygon
+from shapely.geometry import Point, LineString, Polygon, box
 from shapely.ops import transform
 import pyproj
 import random
@@ -276,10 +276,34 @@ def add_sectors_to_map(m, sectors_gdf):
         layer.add_to(m)
 
 def add_population_points_heatmap(m, pop_points_gdf):
-    if not pop_points_gdf.empty:
-        # For HeatMap, data format is list of [lat, lon] or [lat, lon, weight]
-        heat_data = [[point.y, point.x] for point in pop_points_gdf.geometry]
-        HeatMap(heat_data, name="Population Density", radius=15, blur=10).add_to(m)
+    if pop_points_gdf.empty:
+        return
+
+    # Option A: Weighted point‐based heatmap
+    heat_data = [
+        [pt.y, pt.x, pop]
+        for pt, pop in zip(pop_points_gdf.geometry, pop_points_gdf.population)
+    ]
+    HeatMap(
+        heat_data,
+        name="Population Density (weighted)",
+        radius=10,    # try smaller or larger
+        blur=15,      # or lower blur for crisper spots
+        min_opacity=0.2
+    ).add_to(m)
+
+    # Option B: Choropleth
+    folium.Choropleth(
+        geo_data=grid_gdf.__geo_interface__,
+        data=grid_gdf,
+        columns=['index', 'population'],
+        key_on='feature.properties.index',
+        fill_color='YlOrRd',
+        fill_opacity=0.6,
+        line_opacity=0.1,
+        name='Choropleth Population'
+    ).add_to(m)
+
 
 def add_pois_to_map_detailed(m, pois_gdf, key_hubs):
     # Generic POIs
@@ -353,15 +377,77 @@ def add_routes_and_stops_to_map_detailed(m, routes_gdf, stops_gdf):
 if __name__ == "__main__":
     admin_boundary_gdf, G_roads, G_roads_proj, pois_gdf = fetch_base_data(PLACE_QUERY, NETWORK_TYPE)
     
+    # Read your CSV with the correct column names
+    grid_df = pd.read_csv("pop_dens.csv")
+    
+    # Create grid cells from point data
+    # Assuming each point represents the center of a grid cell
+    # You'll need to define the cell size - common sizes are 100m, 250m, 500m, or 1km
+    CELL_SIZE_DEGREES = 0.01  # Approximately 1km at this latitude
+    
+    # Create square polygons around each point
+    grid_df["geometry"] = grid_df.apply(
+        lambda r: box(
+            r.lon - CELL_SIZE_DEGREES/2,  # minx
+            r.lat - CELL_SIZE_DEGREES/2,  # miny  
+            r.lon + CELL_SIZE_DEGREES/2,  # maxx
+            r.lat + CELL_SIZE_DEGREES/2   # maxy
+        ),
+        axis=1
+    )
+    
+    # Rename pop_density to population for consistency with your existing code
+    grid_df["population"] = grid_df["pop_density"]
+    
+    # Create GeoDataFrame
+    grid_gdf = gpd.GeoDataFrame(grid_df, crs=WGS84_CRS)
+    
+    # Keep only the cells inside Chișinău
+    grid_gdf = gpd.clip(grid_gdf, admin_boundary_gdf.unary_union)
+    
+    # Remove cells with zero or very low population to avoid issues
+    grid_gdf = grid_gdf[grid_gdf["population"] > 0.1]
+    
+    print(f"Loaded {len(grid_gdf)} population grid cells within Chișinău boundaries")
+    print(f"Population density range: {grid_gdf['population'].min():.2f} - {grid_gdf['population'].max():.2f}")
+    
     city_center_lon, city_center_lat = 28.8328014700474, 47.02490252911852
     city_centroid_wgs84 = Point(city_center_lon, city_center_lat)
     sectors_gdf = define_chisinau_sectors(city_centroid_wgs84)
-    pop_points_gdf = generate_population_points(sectors_gdf, NUM_POP_POINTS_PER_SECTOR_BASE)
+    
+    def sample_population_origins(grid_gdf, n_points):
+        """Sample population origins weighted by population density"""
+        if grid_gdf.empty:
+            print("Warning: No population data available")
+            return gpd.GeoDataFrame({"geometry": []}, crs=grid_gdf.crs)
+            
+        # Weight each cell by its population
+        weights = grid_gdf["population"] / grid_gdf["population"].sum()
+        
+        # Sample cells with replacement, weighted by population
+        sampled = grid_gdf.sample(n=n_points, weights=weights, random_state=42, replace=True)
+        
+        origins = []
+        for _, cell in sampled.iterrows():
+            minx, miny, maxx, maxy = cell.geometry.bounds
+            # Generate random point within the cell
+            x = np.random.uniform(minx, maxx)
+            y = np.random.uniform(miny, maxy)
+            origins.append(Point(x, y))
+        
+        return gpd.GeoDataFrame({"geometry": origins}, crs=grid_gdf.crs)
+    
+    # Sample population points
+    NUM_POINTS = 2000
+    pop_points_gdf = sample_population_origins(grid_gdf, NUM_POINTS)
+    
+    # Continue with the rest of your existing code...
     mircea_end = (28.890937, 47.055966)
     mircea_point = gpd.GeoDataFrame(
-    [{'geometry': Point(mircea_end), 'sector': 'Ciocana', 'type': 'population_origin'}],
-    crs=WGS84_CRS
+        [{'geometry': Point(mircea_end), 'sector': 'Ciocana', 'type': 'population_origin'}],
+        crs=WGS84_CRS
     )
+    
     # After generating pop_points_gdf and mircea_point
     special_demand_point = gpd.GeoDataFrame(
     [{
